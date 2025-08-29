@@ -449,6 +449,63 @@ dir=$("$HOME/bin/latest_transcript_dir.sh")
 EOF_CP
 
 # -----------------------------
+# 7.5) Export / zip / open helpers
+# -----------------------------
+cat > "$HOME/bin/export_to_storage.sh" << 'EOF_EXP'
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+SRC_DIR="${1:-}"
+if [ -z "$SRC_DIR" ]; then
+  SRC_DIR=$(ls -1dt "$HOME/Transcripts"/* 2>/dev/null | head -n1)
+fi
+[ -z "$SRC_DIR" ] && { echo "No transcript folder found."; exit 1; }
+DEST_BASE="$HOME/storage/shared/Documents/Transcripts"
+mkdir -p "$DEST_BASE"
+SESSION="$(basename "$SRC_DIR")"
+DEST="$DEST_BASE/$SESSION"
+rm -rf "$DEST"
+cp -a "$SRC_DIR" "$DEST"
+echo "Exported to: $DEST"
+termux-toast "Exported to Documents/Transcripts/$SESSION" 2>/dev/null || true
+EOF_EXP
+chmod +x "$HOME/bin/export_to_storage.sh"
+
+cat > "$HOME/bin/zip_transcript.sh" << 'EOF_ZIP'
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+SRC_DIR="${1:-}"
+if [ -z "$SRC_DIR" ]; then
+  SRC_DIR=$(ls -1dt "$HOME/Transcripts"/* 2>/dev/null | head -n1)
+fi
+[ -z "$SRC_DIR" ] && { echo "No transcript folder found."; exit 1; }
+SESSION="$(basename "$SRC_DIR")"
+DEST_DIR="$HOME/storage/shared/Documents/Transcripts"
+mkdir -p "$DEST_DIR"
+ZIP="$DEST_DIR/${SESSION}.zip"
+rm -f "$ZIP"
+( cd "$(dirname "$SRC_DIR")" && zip -r "$ZIP" "$SESSION" >/dev/null )
+echo "Zipped to: $ZIP"
+termux-toast "Zipped → Documents/Transcripts/${SESSION}.zip" 2>/dev/null || true
+EOF_ZIP
+chmod +x "$HOME/bin/zip_transcript.sh"
+
+cat > "$HOME/bin/open_exported_summary.sh" << 'EOF_OPEN'
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+BASE="$HOME/storage/shared/Documents/Transcripts"
+[ -d "$BASE" ] || { echo "No exported transcripts in Documents/Transcripts"; exit 1; }
+LATEST=$(ls -1dt "$BASE"/*/ 2>/dev/null | head -n1)
+[ -z "$LATEST" ] && { echo "No exported transcript folder found"; exit 1; }
+if [ -f "${LATEST}/summary.md" ]; then
+  termux-open --content-type text/markdown "${LATEST}/summary.md" 2>/dev/null || termux-open "${LATEST}/summary.md"
+else
+  termux-open "${LATEST}"
+fi
+EOF_OPEN
+chmod +x "$HOME/bin/open_exported_summary.sh"
+
+
+# -----------------------------
 # 8) Permissions
 # -----------------------------
 chmod +x "$HOME/bin/"*.sh || true

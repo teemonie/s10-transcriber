@@ -4,21 +4,32 @@ set -euo pipefail
 echo "=== S10 Offline Transcriber — One-Click Installer ==="
 
 # -----------------------------
-# 0) Sanity & prerequisites
+# 0) Sanity
 # -----------------------------
 if ! command -v pkg >/dev/null 2>&1; then
-  echo "This script must run in Termux. Open the Termux app and retry."
+  echo "This script must run inside the Termux app."
   exit 1
 fi
 
 # -----------------------------
-# 1) Termux packages
+# 1) Termux packages (+ API check)
 # -----------------------------
 echo "[*] Updating Termux..."
 pkg update -y && pkg upgrade -y
 
 echo "[*] Installing base packages..."
-pkg install -y git build-essential ffmpeg python termux-api openssh
+pkg install -y git build-essential ffmpeg python openssh
+
+# Check/advise for Termux:API (needed for notifications, mic record, clipboard, open)
+echo "[*] Checking Termux:API..."
+if ! pkg list-installed | grep -q '^termux-api/'; then
+  echo "⚠️  Termux:API package not installed in Termux."
+  echo "   • Install the companion app from F-Droid: https://f-droid.org/packages/com.termux.api/"
+  echo "   • Then run in Termux:  pkg install termux-api"
+  echo "   Installer will continue, but any 'termux-*' commands will fail until you do this."
+else
+  echo "✓ Termux:API found."
+fi
 
 echo "[*] Installing Python extras (wake-word & audio IO)..."
 pkg install -y python-pip portaudio || true
@@ -72,7 +83,7 @@ EOF_CFG
 # -----------------------------
 echo "[*] Writing core scripts..."
 
-# Start recording (background service via Termux:API)
+# Start recording
 cat > "$HOME/bin/start_record.sh" << 'EOF_START'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
@@ -87,7 +98,7 @@ termux-microphone-record --file "$RAW" --start
 echo "$RAW" > "$HOME/.current_recording"
 EOF_START
 
-# Stop + transcribe (Whisper + postprocessing + optional local share)
+# Stop + transcribe
 cat > "$HOME/bin/stop_and_transcribe.sh" << 'EOF_STOP'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
@@ -100,7 +111,6 @@ if [ -z "$REC_FILE" ] || [ ! -f "$REC_FILE" ]; then
   exit 1
 fi
 
-# Stop recording
 termux-microphone-record --stop || true
 termux-notification --id 7001 --title "Transcribe" --content "Preparing audio…" --prio max
 
@@ -141,7 +151,7 @@ done
 TXT="$TRG/$(basename "$WAV16").txt"
 SRT="$TRG/$(basename "$WAV16").srt"
 
-# Postprocess: summary, tasks, chapters, highlights, tags, diarization-lite
+# Postprocess
 termux-notification --id 7001 --title "Transcribe" --content "Post-processing…" --prio max --ongoing
 python "$HOME/bin/postprocess_transcript.py" --txt "$TXT" --srt "$SRT" --outdir "$TRG" --gap "${CHAPTER_GAP:-7}" --minlen "${MIN_CHAPTER_LEN:-30}" || true
 python "$HOME/bin/export_tasks.py" --tasks "$TRG/tasks.md" --outdir "$TRG" || true
@@ -157,7 +167,7 @@ rm -f "$HOME/.current_recording"
 echo "Saved to: $TRG"
 EOF_STOP
 
-# Toggle (one button)
+# Toggle
 cat > "$HOME/bin/toggle_rec.sh" << 'EOF_TOG'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
@@ -173,7 +183,6 @@ EOF_TOG
 # -----------------------------
 echo "[*] Writing post-processing scripts..."
 
-# postprocess_transcript.py
 cat > "$HOME/bin/postprocess_transcript.py" << 'EOF_PP'
 #!/data/data/com.termux/files/usr/bin/python
 # Summary, tasks, chapters, highlights, tags + diarization-lite (if SRT present)
@@ -193,7 +202,6 @@ def top_keywords(t,n=12):
 def summarize(t,n=6):
     sents=sent_tokenize(t); return sents[:n] if sents else []
 def extract_tasks(t):
-    # naive pattern for action sentences
     return re.findall(r'(?:we|i|let\'s|lets|please|team)\s+(?:will|need to|should|must|can|to)\s+[^.]+', t, re.I)
 
 def parse_srt(srt):
@@ -287,7 +295,6 @@ if __name__=="__main__":
 EOF_PP
 chmod +x "$HOME/bin/postprocess_transcript.py"
 
-# export_tasks.py
 cat > "$HOME/bin/export_tasks.py" << 'EOF_EX'
 #!/data/data/com.termux/files/usr/bin/python
 # Convert tasks.md to CSV + ICS (VTODO)
@@ -340,11 +347,10 @@ EOF_EX
 chmod +x "$HOME/bin/export_tasks.py"
 
 # -----------------------------
-# 7) Wake-word & helper scripts
+# 7) Wake-word & helpers
 # -----------------------------
 echo "[*] Writing wake-word + helper scripts..."
 
-# wakeword_toggle.py (uses openwakeword + sounddevice)
 cat > "$HOME/bin/wakeword_toggle.py" << 'EOF_WW'
 #!/data/data/com.termux/files/usr/bin/python
 # Wake-word listener triggers toggle on "hey note"/"okay note"
@@ -381,7 +387,6 @@ if __name__=="__main__":
 EOF_WW
 chmod +x "$HOME/bin/wakeword_toggle.py"
 
-# Start/stop wake-word as a background process
 cat > "$HOME/bin/wakeword_start.sh" << 'EOF_WWS'
 #!/data/data/com.termux/files/usr/bin/bash
 nohup python /data/data/com.termux/files/home/bin/wakeword_toggle.py >/data/data/com.termux/files/home/logs/wakeword.log 2>&1 &
@@ -400,7 +405,6 @@ termux-notification --id 7003 --remove
 termux-toast "Wake word stopped"
 EOF_WWE
 
-# Transcript helpers
 cat > "$HOME/bin/list_transcripts.sh" << 'EOF_LT'
 #!/data/data/com.termux/files/usr/bin/bash
 N=${1:-30}
@@ -450,7 +454,7 @@ EOF_CP
 chmod +x "$HOME/bin/"*.sh || true
 
 # -----------------------------
-# 9) Final instructions
+# 9) Final tips
 # -----------------------------
 echo
 echo "=== Install complete! ==="
@@ -474,4 +478,4 @@ echo "  Audio:       ~/Recordings/"
 echo "  Transcripts: ~/Transcripts/<session>/"
 echo "    summary.md, tasks.md, chapters.md, highlights.md, tags.txt, speakers.vtt, tasks.csv, tasks.ics"
 echo
-echo "For a Tasker Scene, wire buttons to the shell commands above (no root needed)."
+echo "If you saw the Termux:API warning above, install it from F-Droid and run: pkg install termux-api"

@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -euo pipefail
 
-echo "=== S10 Offline Transcriber — One-Click Installer ==="
+echo "=== S10 Offline Transcriber — One-Click Installer (All Updates) ==="
 
 # -----------------------------
 # 0) Sanity
@@ -18,7 +18,7 @@ echo "[*] Updating Termux..."
 pkg update -y && pkg upgrade -y
 
 echo "[*] Installing base packages..."
-pkg install -y git build-essential ffmpeg python openssh
+pkg install -y git build-essential ffmpeg python openssh zip
 
 # Check/advise for Termux:API (needed for notifications, mic record, clipboard, open)
 echo "[*] Checking Termux:API..."
@@ -83,7 +83,7 @@ EOF_CFG
 # -----------------------------
 echo "[*] Writing core scripts..."
 
-# Start recording
+# Start recording (correct flags; -f to start)
 cat > "$HOME/bin/start_record.sh" << 'EOF_START'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
@@ -91,57 +91,66 @@ OUTDIR="$HOME/Recordings"
 mkdir -p "$OUTDIR"
 STAMP=$(date +%Y%m%d_%H%M%S)
 RAW="$OUTDIR/rec_${STAMP}.wav"
-# Stop any previous recorder
-termux-microphone-record --stop >/dev/null 2>&1 || true
-termux-notification --id 7001 --title "Recorder" --content "Recording started…" --ongoing
-termux-microphone-record --file "$RAW" --start
+
+# Stop any previous recording session (quietly)
+termux-microphone-record -q >/dev/null 2>&1 || true
+
+# Notify and start recording to file
+termux-notification --id 7001 --title "Recorder" --content "Recording started…" --ongoing || true
+termux-microphone-record -f "$RAW"
+
 echo "$RAW" > "$HOME/.current_recording"
 EOF_START
+chmod +x "$HOME/bin/start_record.sh"
 
-# Stop + transcribe
+# Stop + transcribe (uses '.' instead of 'source'; logs progress)
 cat > "$HOME/bin/stop_and_transcribe.sh" << 'EOF_STOP'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
 CONF="$HOME/bin/config.env"
-[ -f "$CONF" ] && source "$CONF" || true
+[ -f "$CONF" ] && . "$CONF" || true
 
 REC_FILE=$(cat "$HOME/.current_recording" 2>/dev/null || true)
 if [ -z "$REC_FILE" ] || [ ! -f "$REC_FILE" ]; then
-  termux-notification --id 7001 --title "Recorder" --content "No active recording found." --prio max
+  termux-notification --id 7001 --title "Recorder" --content "No active recording found." --prio max || true
+  echo "No active recording."
   exit 1
 fi
 
-termux-microphone-record --stop || true
-termux-notification --id 7001 --title "Transcribe" --content "Preparing audio…" --prio max
+echo "[1/6] Stopping recorder…"
+termux-microphone-record -q || true
+termux-notification --id 7001 --title "Transcribe" --content "Preparing audio…" --prio max || true
 
+echo "[2/6] Converting to 16k mono…"
 BASE=$(basename "$REC_FILE" .wav)
 DIR=$(dirname "$REC_FILE")
 WAV16="${DIR}/${BASE}_16k.wav"
 
-# Normalize to 16k mono (optional denoise)
+# Convert to 16 kHz mono (optional denoise)
 if [ "${DENOISE,,}" = "yes" ]; then
   ffmpeg -y -i "$REC_FILE" -af "afftdn=nf=-20" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV16" >/dev/null 2>&1
 else
   ffmpeg -y -i "$REC_FILE" -ac 1 -ar 16000 -c:a pcm_s16le "$WAV16" >/dev/null 2>&1
 fi
 
-# Choose model
+# Pick model
 if [ "${MODEL,,}" = "tiny" ]; then
   MODEL_PATH="${HOME}/whisper.cpp/models/ggml-tiny.en.bin"
 else
   MODEL_PATH="${HOME}/whisper.cpp/models/ggml-base.en.bin"
 fi
 
-termux-notification --id 7001 --title "Transcribe" --content "Running Whisper (${MODEL_PATH##*/})…" --prio max --ongoing
+echo "[3/6] Transcribing with Whisper (${MODEL_PATH##*/})…"
+termux-notification --id 7001 --title "Transcribe" --content "Running Whisper…" --prio max --ongoing || true
 cd "$HOME/whisper.cpp"
 LOG="$HOME/logs/whisper_$(date +%s).log"
 ./main -m "$MODEL_PATH" -f "$WAV16" -otxt -osrt -ovtt > "$LOG" 2>&1 || {
-  termux-notification --id 7001 --title "Transcribe" --content "Whisper failed. See logs." --prio max
+  termux-notification --id 7001 --title "Transcribe" --content "Whisper failed. See logs." --prio max || true
   echo "Whisper failed. Log: $LOG"
   exit 2
 }
 
-# Collect outputs
+echo "[4/6] Saving outputs…"
 TRG="$HOME/Transcripts/$(basename "$BASE")"
 mkdir -p "$TRG"
 for ext in txt srt vtt; do
@@ -151,32 +160,39 @@ done
 TXT="$TRG/$(basename "$WAV16").txt"
 SRT="$TRG/$(basename "$WAV16").srt"
 
-# Postprocess
-termux-notification --id 7001 --title "Transcribe" --content "Post-processing…" --prio max --ongoing
+echo "[5/6] Post-processing (summary, tasks, chapters)…"
 python "$HOME/bin/postprocess_transcript.py" --txt "$TXT" --srt "$SRT" --outdir "$TRG" --gap "${CHAPTER_GAP:-7}" --minlen "${MIN_CHAPTER_LEN:-30}" || true
 python "$HOME/bin/export_tasks.py" --tasks "$TRG/tasks.md" --outdir "$TRG" || true
 
 # Optional local share
 if [ "${AUTOSERVE_MINUTES:-0}" -gt 0 ]; then
-  termux-notification --id 7002 --title "Local Share" --content "Serving $(basename "$TRG") for ${AUTOSERVE_MINUTES} min on http://<S10-IP>:8080/" --prio max
+  termux-notification --id 7002 --title "Local Share" --content "Serving $(basename "$TRG") for ${AUTOSERVE_MINUTES} min on http://<S10-IP>:8080/" --prio max || true
   ( cd "$TRG" && nohup sh -c "python3 -m http.server 8080 & SERVER_PID=$!; sleep $((60*AUTOSERVE_MINUTES)); kill $SERVER_PID 2>/dev/null || true" >/dev/null 2>&1 & )
 fi
 
-termux-notification --id 7001 --title "Transcribe" --content "Done → $(basename "$TRG")" --prio max
-rm -f "$HOME/.current_recording"
-echo "Saved to: $TRG"
-EOF_STOP
+echo "[6/6] Exporting to shared storage, zipping, and opening summary…"
+# Auto-export / zip / open (best-effort)
+bash "$HOME/bin/export_to_storage.sh" "$TRG" || true
+bash "$HOME/bin/zip_transcript.sh" "$TRG" || true
+bash "$HOME/bin/open_exported_summary.sh" || true
 
-# Toggle
+termux-notification --id 7001 --title "Transcribe" --content "Done → $(basename "$TRG")" --prio max || true
+rm -f "$HOME/.current_recording"
+echo "✅ Done: $TRG"
+EOF_STOP
+chmod +x "$HOME/bin/stop_and_transcribe.sh"
+
+# Toggle (one button)
 cat > "$HOME/bin/toggle_rec.sh" << 'EOF_TOG'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
 if [ -f "$HOME/.current_recording" ]; then
-  sh "$HOME/bin/stop_and_transcribe.sh"
+  bash "$HOME/bin/stop_and_transcribe.sh"
 else
-  sh "$HOME/bin/start_record.sh"
+  bash "$HOME/bin/start_record.sh"
 fi
 EOF_TOG
+chmod +x "$HOME/bin/toggle_rec.sh"
 
 # -----------------------------
 # 6) Post-processing (Python)
@@ -391,8 +407,9 @@ cat > "$HOME/bin/wakeword_start.sh" << 'EOF_WWS'
 #!/data/data/com.termux/files/usr/bin/bash
 nohup python /data/data/com.termux/files/home/bin/wakeword_toggle.py >/data/data/com.termux/files/home/logs/wakeword.log 2>&1 &
 echo $! > /data/data/com.termux/files/home/.wakeword_pid
-termux-notification --id 7003 --title "Wake Word" --content "Listening (hey note / okay note)..." --ongoing
+termux-notification --id 7003 --title "Wake Word" --content "Listening (hey note / okay note)..." --ongoing || true
 EOF_WWS
+chmod +x "$HOME/bin/wakeword_start.sh"
 
 cat > "$HOME/bin/wakeword_stop.sh" << 'EOF_WWE'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -401,10 +418,12 @@ if [ -f /data/data/com.termux/files/home/.wakeword_pid ]; then
   rm -f /data/data/com.termux/files/home/.wakeword_pid
 fi
 pkill -f wakeword_toggle.py 2>/dev/null || true
-termux-notification --id 7003 --remove
-termux-toast "Wake word stopped"
+termux-notification --id 7003 --remove || true
+termux-toast "Wake word stopped" 2>/dev/null || true
 EOF_WWE
+chmod +x "$HOME/bin/wakeword_stop.sh"
 
+# Transcript helpers
 cat > "$HOME/bin/list_transcripts.sh" << 'EOF_LT'
 #!/data/data/com.termux/files/usr/bin/bash
 N=${1:-30}
@@ -413,6 +432,7 @@ base="$HOME/Transcripts"
 cd "$base"
 ls -1t | head -n "$N"
 EOF_LT
+chmod +x "$HOME/bin/list_transcripts.sh"
 
 cat > "$HOME/bin/latest_transcript_dir.sh" << 'EOF_LD'
 #!/data/data/com.termux/files/usr/bin/bash
@@ -422,49 +442,62 @@ cd "$base"
 latest=$(ls -1t | head -n 1)
 [ -n "$latest" ] && echo "$base/$latest"
 EOF_LD
+chmod +x "$HOME/bin/latest_transcript_dir.sh"
 
 cat > "$HOME/bin/serve_latest.sh" << 'EOF_SL'
 #!/data/data/com.termux/files/usr/bin/bash
 CONF="$HOME/bin/config.env"
-[ -f "$CONF" ] && source "$CONF" || true
+[ -f "$CONF" ] && . "$CONF" || true
 MIN=${1:-$AUTOSERVE_MINUTES}
 [ -z "$MIN" ] && MIN=10
 dir=$("$HOME/bin/latest_transcript_dir.sh")
-[ -z "$dir" ] && { termux-toast "No transcripts yet"; exit 1; }
-termux-notification --id 7002 --title "Local Share" --content "Serving $(basename "$dir") for ${MIN} min on http://<S10-IP>:8080/" --prio max
+[ -z "$dir" ] && { termux-toast "No transcripts yet" 2>/dev/null || true; echo "No transcripts yet"; exit 1; }
+termux-notification --id 7002 --title "Local Share" --content "Serving $(basename "$dir") for ${MIN} min on http://<S10-IP>:8080/" --prio max || true
 ( cd "$dir" && nohup sh -c "python3 -m http.server 8080 & SERVER_PID=$!; sleep $((60*MIN)); kill $SERVER_PID 2>/dev/null || true" >/dev/null 2>&1 & )
 EOF_SL
+chmod +x "$HOME/bin/serve_latest.sh"
 
 cat > "$HOME/bin/open_latest_in_files.sh" << 'EOF_OL'
 #!/data/data/com.termux/files/usr/bin/bash
 dir=$("$HOME/bin/latest_transcript_dir.sh")
-[ -z "$dir" ] && { termux-toast "No transcripts"; exit 1; }
+[ -z "$dir" ] && { termux-toast "No transcripts" 2>/dev/null || true; echo "No transcripts"; exit 1; }
 termux-open --content-type text/plain "$dir/summary.md" 2>/dev/null || termux-open "$dir"
 EOF_OL
+chmod +x "$HOME/bin/open_latest_in_files.sh"
 
 cat > "$HOME/bin/copy_latest_path.sh" << 'EOF_CP'
 #!/data/data/com.termux/files/usr/bin/bash
 dir=$("$HOME/bin/latest_transcript_dir.sh")
-[ -n "$dir" ] && echo -n "$dir" | termux-clipboard-set && termux-toast "Path copied"
+[ -n "$dir" ] && echo -n "$dir" | termux-clipboard-set && termux-toast "Path copied" 2>/dev/null || true
 EOF_CP
+chmod +x "$HOME/bin/copy_latest_path.sh"
 
 # -----------------------------
-# 7.5) Export / zip / open helpers
+# 7.5) Export / zip / open helpers (NEW)
 # -----------------------------
+echo "[*] Writing export/zip/open helpers..."
+
 cat > "$HOME/bin/export_to_storage.sh" << 'EOF_EXP'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
+# Ensure shared storage available
+[ -d "$HOME/storage/shared" ] || { echo "Shared storage not initialized. Run: termux-setup-storage"; exit 1; }
+
 SRC_DIR="${1:-}"
 if [ -z "$SRC_DIR" ]; then
   SRC_DIR=$(ls -1dt "$HOME/Transcripts"/* 2>/dev/null | head -n1)
 fi
 [ -z "$SRC_DIR" ] && { echo "No transcript folder found."; exit 1; }
+
 DEST_BASE="$HOME/storage/shared/Documents/Transcripts"
 mkdir -p "$DEST_BASE"
+
 SESSION="$(basename "$SRC_DIR")"
 DEST="$DEST_BASE/$SESSION"
+
 rm -rf "$DEST"
 cp -a "$SRC_DIR" "$DEST"
+
 echo "Exported to: $DEST"
 termux-toast "Exported to Documents/Transcripts/$SESSION" 2>/dev/null || true
 EOF_EXP
@@ -473,17 +506,23 @@ chmod +x "$HOME/bin/export_to_storage.sh"
 cat > "$HOME/bin/zip_transcript.sh" << 'EOF_ZIP'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
+# Ensure shared storage available
+[ -d "$HOME/storage/shared" ] || { echo "Shared storage not initialized. Run: termux-setup-storage"; exit 1; }
+
 SRC_DIR="${1:-}"
 if [ -z "$SRC_DIR" ]; then
   SRC_DIR=$(ls -1dt "$HOME/Transcripts"/* 2>/dev/null | head -n1)
 fi
 [ -z "$SRC_DIR" ] && { echo "No transcript folder found."; exit 1; }
+
 SESSION="$(basename "$SRC_DIR")"
 DEST_DIR="$HOME/storage/shared/Documents/Transcripts"
 mkdir -p "$DEST_DIR"
+
 ZIP="$DEST_DIR/${SESSION}.zip"
 rm -f "$ZIP"
 ( cd "$(dirname "$SRC_DIR")" && zip -r "$ZIP" "$SESSION" >/dev/null )
+
 echo "Zipped to: $ZIP"
 termux-toast "Zipped → Documents/Transcripts/${SESSION}.zip" 2>/dev/null || true
 EOF_ZIP
@@ -492,10 +531,14 @@ chmod +x "$HOME/bin/zip_transcript.sh"
 cat > "$HOME/bin/open_exported_summary.sh" << 'EOF_OPEN'
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
+# Ensure shared storage available
+[ -d "$HOME/storage/shared" ] || { echo "Shared storage not initialized. Run: termux-setup-storage"; exit 1; }
+
 BASE="$HOME/storage/shared/Documents/Transcripts"
 [ -d "$BASE" ] || { echo "No exported transcripts in Documents/Transcripts"; exit 1; }
 LATEST=$(ls -1dt "$BASE"/*/ 2>/dev/null | head -n1)
 [ -z "$LATEST" ] && { echo "No exported transcript folder found"; exit 1; }
+
 if [ -f "${LATEST}/summary.md" ]; then
   termux-open --content-type text/markdown "${LATEST}/summary.md" 2>/dev/null || termux-open "${LATEST}/summary.md"
 else
@@ -503,7 +546,6 @@ else
 fi
 EOF_OPEN
 chmod +x "$HOME/bin/open_exported_summary.sh"
-
 
 # -----------------------------
 # 8) Permissions
@@ -515,20 +557,25 @@ chmod +x "$HOME/bin/"*.sh || true
 # -----------------------------
 echo
 echo "=== Install complete! ==="
+echo "If you haven't yet, grant shared storage: termux-setup-storage"
+echo
 echo "Try these commands:"
-echo "  sh ~/bin/start_record.sh           # start recording"
-echo "  sh ~/bin/stop_and_transcribe.sh    # stop & transcribe (offline)"
-echo "  sh ~/bin/toggle_rec.sh             # single-button toggle"
+echo "  bash ~/bin/start_record.sh         # start recording"
+echo "  bash ~/bin/stop_and_transcribe.sh  # stop & transcribe (offline)"
+echo "  bash ~/bin/toggle_rec.sh           # single-button toggle"
 echo
 echo "Wake-word (optional):"
-echo "  sh ~/bin/wakeword_start.sh         # say 'hey note' / 'okay note'"
-echo "  sh ~/bin/wakeword_stop.sh"
+echo "  bash ~/bin/wakeword_start.sh       # say 'hey note' / 'okay note'"
+echo "  bash ~/bin/wakeword_stop.sh"
 echo
 echo "Transcript helpers:"
-echo "  sh ~/bin/list_transcripts.sh 20    # list recent"
-echo "  sh ~/bin/serve_latest.sh 10        # serve latest on :8080 for 10 min"
-echo "  sh ~/bin/open_latest_in_files.sh   # open latest in a viewer"
-echo "  sh ~/bin/copy_latest_path.sh       # copy latest path to clipboard"
+echo "  bash ~/bin/list_transcripts.sh 20  # list recent"
+echo "  bash ~/bin/serve_latest.sh 10      # serve latest on :8080 for 10 min"
+echo "  bash ~/bin/open_latest_in_files.sh # open latest in a viewer"
+echo "  bash ~/bin/copy_latest_path.sh     # copy latest path"
+echo "  bash ~/bin/export_to_storage.sh    # export latest to Documents/Transcripts"
+echo "  bash ~/bin/zip_transcript.sh       # zip latest into Documents/Transcripts"
+echo "  bash ~/bin/open_exported_summary.sh# open latest exported summary"
 echo
 echo "Files land in:"
 echo "  Audio:       ~/Recordings/"
